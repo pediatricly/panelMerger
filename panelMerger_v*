@@ -1,0 +1,676 @@
+#!/usr/bin/python
+
+"""		
+panelMerger_v#.py
+This Python (2.7) program was developed by Mike Scahill (mdscahill@gmail.com) for the 
+2014-5 #QI project for Monday Pod at SFGH Pediatrics 6M Continuity Clinic. The initial
+builds were done in Feb 2015.
+
+GOAL: Have a shared panel management tool that various team members can use & update 
+individually and then periodically (every week before clinic) merge back into a unified
+file. This way, team members can share info to cross-cover patients & to-dos.
+This is a sort of poor man's GoogleDocs that tries to solve the multiple updates problem
+without a cloud (violating HIPPA).
+The spreadsheets makeup shortcomings in eCW - crappy remote access, poor to-do tracking, 
+no way to produce a "signout". 
+
+How It Works:
+- Several Pod members have panel management spreadsheets built on the same template
+- They update them every week with new information, new patients
+- Every spreadsheet has 2 sections: 
+	- the "Active" area to the left where providers update & use info 
+	- the "Archive" area to the right which is hidden from providers. The Archive records 
+	what each entry looked like at the last merge iteration. This is critical to find 
+	which records have been updated and so lets the Merger program know which of multiple
+	entries for the same patient to keep.
+- At a designated time every week, everyone sends their spreadsheets to the program mgr.
+- Put all those files into the subfolder "path" below. This program + spreadsheet 
+templates live in that folder's parent folder.
+- Run this Merger program (using the Unix command line python panelMerger_v#.py
+- panelMerger then:
+	- Reads all the spreadsheet files in the subfolder "path"
+	- Finds updated entries by comparing the Active to Archive sections
+	- Copies all the updated entries to the new spreadsheet
+	- Fills in 1 copy of all the old, non-updated entries as well
+	- Outputs any CONFLCIT entries to both that spreadsheet & a separate CONFLICT
+	spreadsheet. In the rare case where 2 team members updated the same patient entry 
+	in 2 different places (different spreadsheets or duplicate entries in the same sheet),
+	the computer cannot know which to keep. So it keeps both & highlights them for the 
+	humans on the team to sort out (which you must do or you'll get another conflict next
+	week).
+
+
+panelMerger draws heavily on this module:
+Python Excel - http://www.python-excel.org/
+
+There are at least 2 other modules that may be worth checking out in future:
+https://pypi.python.org/pypi/openpyxl
+http://xlsxwriter.readthedocs.org/
+
+Version History:
+-------------------------------
+v8: Names output files with the current date automatically. 
+Also fixes a bug that formatted IZ instead of DOB as date in Prepped tab.
+
+v7: preppedWriter is born - was having issues with the named ranges linking to old 
+versions of the sheet so I sacked up & wrote the code to use xlwt to recreate the 
+fancy index(match)) formulas that make the Prepped tab work.
+Also created a Version sheet & wrote data to it to help track all these file updates.
+
+v6: In first real world trials, issues came up with the Record field. It creates confusion
+and breaks when sorting the sheet. Once broken, relying on it to come up with the # of 
+data rows is messy (you basically need to fix records first). So, v6 gets rid of it 
+entirely.
+- get rid of lastRowFinder
+- read the entire sheet (xlrd ignores totally blank rows / columns anyway)
+- filter out blank & validation rows. Append the rest to bigList
+v6 makes a few other minor improvements:
+	- hides the archive columns
+	- adds the TabStop finder & uses it to write the ageCol formula into the o/w blank 
+	rows
+
+v5: Debugged to work with actual panels at #QI launch in Mar15. Fixes a few minor issues:
+  - lastRowFinder had issues with the unicode produced by xlrd and wasn't calculating the
+  max(records) as a result. Fixed this and managed to get rid of the tabStop variable in 
+  the process (which is nice as that was definitely a bad feature that could cutoff a 
+  large spreadsheet). 
+  - Typo in for filename in dir loop
+  - Read loop was crashing as the newly reformatted panels had blank columns where Archive
+  should have been. So it just ignored these and then had nothing to compare them to when
+  looking for updates. Fixed this simply by putting column headings in the input panels.
+
+v4: First beta version! Organized globals, full explanatory comments. 
+Cleans out old comments which are preserved in v3
+
+v3: Redo the reconciliation problem with additional writeList to fix the duplicates.
+Also fixes a bug in writeLoop that had newBook global instead of a local.
+
+v2: The big change for v2 is getting rid of updateFlag completely from Excel & letting 
+Python compare Active to Archive directly.
+
+v1: Building up the basic functions using 1 input sheet.
+
+Things to do:
+-------------------------------
+	
+Gravy Improvements:
+-------------------------------
+- Use a set https://docs.python.org/2/tutorial/datastructures.html#sets instead of the
+duplicate toss out for writeList
+- Make the file/path functions robust to location
+- Have the program find the column headers & firstDataRow automatically
++++++++++++++++++++++++++++++++++++++++
+"""
+
+import os.path
+from xlrd import open_workbook, cellnameabs, colname
+from xlwt import Workbook, Formula, easyxf, Utils
+from xlutils.copy import copy
+from datetime import date
+
+"""
+Gobals
+Can eventually write a __main__ for them but may need to keep global to avoid big re-write
+"""
+
+#This is the name of the subdirectory where the individual panels are copied.
+#So this program sits in the parent directory with the templates & output panels.
+#This child directory sits with them and holds the input files.
+#The program will read any and all .xls(x) files in this directory. 
+path = 'inputPanels'
+
+#The first data row in the panel spreadsheets - must be the same across them all & the
+#template as currently written in v4. Recall Excel row 1 = Python 0
+firstDataRow = 2
+
+#This is the column where the archive starts. Must be the same across all input & template
+# files. As with rows, Excel A = Python 0
+archiveOffset = 19
+
+#These constants tell Python which column to find these data, assumes they are mirrored
+#perfectly in the Archive area.
+#If I ever get time / fancy, make this to a module & turn it into a dict
+
+lname = 0
+fname = lname + 1
+MRN = fname +1
+DOB = MRN + 1
+ageCol = DOB + 1
+parent = ageCol + 1
+contact = parent + 1
+PCP = contact + 1
+probList = PCP + 1
+IZs = probList + 1
+dev = IZs + 1
+lastAppt = dev + 1
+fuNeed = lastAppt + 1
+fuNeedDate = fuNeed + 1
+refOut = fuNeedDate + 1
+refDone = refOut + 1
+conflictFlag = refDone + 2
+
+MRNvalLow = 1000000
+MRNvalHi = 9999999
+
+'''
+# These are the program's variable names for Excel column headings
+# They don't need to match the names of the Excel columns as they are set here
+# They MUST however be in the exact same order with no missing columns
+# The order is how the program knows how to treat each column
+# The program also assumes the Archive area of the spreadsheet is in mirror order.
+Removed Record as of v6
+'''
+varCols = [lname, fname, MRN, DOB, ageCol, parent, contact, PCP, probList, IZs, 
+	dev, lastAppt, fuNeed, fuNeedDate, refOut, refDone, conflictFlag]
+
+bigList = []
+updatedMRNs = []
+conflictMRNs = []
+writeList = []
+writtenMRNs = []
+conflictList = []
+fragList = []
+TabStops = []
+inputFiles = []
+
+#######################
+# New sheet parameters for the write loop
+# Tell program which template files to use & which filename to save under.
+#######################
+
+#The templates just provide consistent architecture on which to write the panel
+panelTemplate = open_workbook('panelTemplate.xls', 'rb')
+
+'''
+#The Python Excel module can only write to a Python object based on the spreadsheet.
+#Hence this copy() function.
+#The drawback is that it destroys formats & formulas in the process.
+#These can be rewritten with Python code (writeLoop does this for the age formulas &
+#date format fields, but it is cumbersome.
+#This is why, as of v4, the Prepped sheet is effectively destroyed in this process.
+v7 brings it back by using Python to write the whole sheet.
+'''
+newBook = copy(panelTemplate)
+
+#Tell Python which sheet holds the panel data. 0 = first sheet
+newPanel = newBook.get_sheet(0)
+prepped = newBook.get_sheet(1)
+versionSheet = newBook.get_sheet(2)
+
+#Tell Python the file name to save your fancy new consolidated panel.
+#It will go in the same parent folder as this program.
+#First, get today's date formatted as a string:
+todayStr = date.today().strftime('%y%m%d')
+#Then make the name with the date baked in:
+newBookName = 'newQIPanel_' + todayStr + '.xls'
+
+conTemplate = open_workbook('conflictTemplate.xls', 'rb')
+conBook = copy(conTemplate)
+conPanel = conBook.get_sheet(0)
+versionSheetC = conBook.get_sheet(2)
+conBookName = 'conflictsPanel_' + todayStr + '.xls'
+	
+#End of the global architecture
+#######################################################
+
+"""
+Modules
+"""
+
+def replace(l, x, y):
+	'''	
+	Replace! A nifty piece of code:
+	http://stackoverflow.com/questions/18776420/python-replacing-element-in-list-without-list-comprehension-slicing-or-using
+	Note that this does NOT work predictably without the insert. Using enumerate just to 
+	delete items fails unpredictably.
+	'''
+	for i, v in enumerate(l):
+		if v == x:
+			l.pop(i)
+			l.insert(i, y)
+	
+"""
+Older versions were designed to use a Record column that relied on a formula in the 
+input spreadsheets to tally how many rows this program should read. This proved not so 
+practical or robust, so I ditched it and adjusted panelReader to handle this using just
+the MRN column. This function is now obsolete as of v6.
+def rowEndFinder(sheet):
+	#Find the # records for lastDataRow
+	records = sheet.col_values(record, firstDataRow)
+	#print records
+	for i, r in enumerate(records):
+		if type(r) is not float:
+			records.pop(i)
+			records.insert(i, 0.0)
+	#replace(records, '', 0.0) #Replaces empty with 0 so max works
+	#print records
+	#records.pop() #Pop off the TabStop - not actually what this does as TabStop variable
+	#is manually defined & unreliable
+	lastDataRow = max(records) + firstDataRow - 1 #In v4, this was failing because strings
+	#were left in records and strings are "greater" than int, float I think
+	lastDataRow = int(round(lastDataRow)) #+ 1
+	print 'lastDataRow =', lastDataRow
+	return lastDataRow
+"""
+	
+def panelReader(sheet):
+	"""
+	The list of lists read loop
+	Builds up littleList (data for each row) then appends it to 
+	bigList (the list of lists that holds the whole panel).
+
+	Make a double read loop for active & archive
+	Compare them
+	Replace updateFlag with 0 in bigList
+
+	"""
+	MRNs = sheet.col_values(MRN, firstDataRow)
+	lastDataRow = len(MRNs)
+	#print lastDataRow
+	TabStop = MRNs.index(u'TabStop')
+	"""
+	Fixed in v6 - lastDataRow is now found using the MRN column & if statements below 
+	filter out garbage rows subsequently.
+	"""
+	for dataRow in range(firstDataRow, lastDataRow + 1):
+		littleList = []
+		archiveList = []
+		for varCol in varCols:
+			cellActive = (sheet.cell_value(dataRow, varCol))
+			littleList.append(cellActive)
+			"""
+			This part was crashing in 1st week because the archive section didn't exist 
+			in old sheets. If the columns for archive are totally empty, xlrd doesn't 
+			include them. They're not blank; they're just non-existent so the read code 
+			crashes. Definitely the easiest solution is to put some column headers, but 
+			maybe there's a more robust solution with a "capture" command.
+			"""
+			cellArchive = (sheet.cell_value(dataRow, varCol + archiveOffset))
+			archiveList.append(cellArchive)
+		
+		'''
+		Note that this archive comparison feature relies on the organization into dataRows
+		The archive data aren't stored after this; only the updateFlag carries on with 
+		a single copy of littleList (the working / left-side data-row) in bigList
+		'''
+		if littleList[:-1] != archiveList[:-1]: #Slice off conflictFlag
+			littleList.append(0) #new updateFlag at end
+		else:
+			littleList.append(1) #new updateFlag at end		
+	
+		'''
+		Filter out lines that are not actual data.
+		Put lines that might be actual data in fragList, which gets printed at the end,
+		to keep an eye out for dumb filtering.
+		'''	
+		if littleList[varCols.index(MRN)] == '':
+			if (littleList[varCols.index(lname)] == '' and littleList[varCols.index(fname)] ==
+                '' and littleList[varCols.index(DOB)] == '' and 
+				littleList[varCols.index(probList)] == ''):
+					#If lname, fname, DOB & ProbList are all blank, it's garbage.
+					break
+			else:
+				bigList.append(littleList)
+				fragList.append(littleList)
+				'''
+				If MRN is blank but other cols have data, it might be a real data row.
+				Append to bigList but also to fragList just to keep an eye out.
+				as of v7, fragList only gets printed to std output, not written to a 
+				file.
+				'''
+		elif (littleList[varCols.index(MRN)] == MRNvalLow or littleList[2] == MRNvalHi or
+			littleList[varCols.index(MRN)] == u'TabStop' or littleList[2] == u'MRN'):
+				break
+			
+		else:
+			bigList.append(littleList)
+	return TabStop
+	'''
+	This loop, to pull out entries with blank MRNs, does not work! 
+	I think what happens is Python doesn't fix the enumeration at the start of the loop, 
+	so removing items throws the system off. The process works but only on ~1/2 the list 
+	until it thinks it's done.
+	http://stackoverflow.com/questions/1207406/remove-items-from-a-list-while-iterating-in-python 
+	
+	#print bigList
+	print len(bigList)
+	for i, littleList in enumerate(bigList):
+		if littleList[varCols.index(MRN)] >MRNvalLow and littleList[varCols.index(MRN)] 
+			< MRNvalLow: 
+		#if littleList[0] == '':
+			#if (littleList[0] == '' and littleList[1] == '' and littleList[3] == '' and 
+			#	littleList[8] == ''):
+					x = 1
+					#print 'this is a dud', littleList
+		else:
+			del bigList[i]
+					#print i	
+	#print bigList
+	print len(bigList)
+	'''
+	
+def panelOpen(filename):
+	'''
+	Used to rip through the input directory to pop out the Panel sheet
+	'''
+	book = open_workbook(filename) #Returns a file object
+	oldPanel = book.sheet_by_index(0) #NB: This assumes the panel is the first (=0) sheet!
+	return oldPanel
+
+def writeLoop(varBook, sheet, list, varName, TabStop):
+	'''
+	The main write function that takes entries from a list & puts them into the Panel
+	spreadsheet columns.
+	It does this twice so an identical copy is stored in the Archive columns, hidden to 
+	the right.
+	conflictFlag written here means conflict from the input panels.
+	'''
+	writeRow = 2
+	for i, entry in enumerate(list):
+		for varCol in varCols:
+			#if varCol == record:
+			#	if i == 0: #
+			#		sheet.write(writeRow, varCol, 1)
+			#	else:
+			#		recordForm = ('IF(D' + str(writeRow + 1) + '="","",1+A' + 
+			#			str(writeRow) + ')')
+			#		sheet.write(writeRow, varCol, Formula(recordForm))	
+			if varCol == ageCol: 
+				ageForm = ('IF((TODAY()-D' + str(writeRow + 1) + ')/365<1,TEXT((TODAY()-D' + 
+					str(writeRow + 1) + ')/30,"#.0")&" mo",TEXT((TODAY()-D' + 
+					str(writeRow + 1) + ')/365,"#.0")&" yr")')
+				sheet.write(writeRow, varCol, Formula(ageForm))
+				sheet.write(writeRow, varCol + archiveOffset, Formula(ageForm))
+			elif varCol == DOB:
+				sheet.write(writeRow, varCol, entry[varCols.index(varCol)], 
+				easyxf(num_format_str='DD MMM YY'))
+				sheet.write(writeRow, varCol + archiveOffset, entry[varCols.index(varCol)], 
+				easyxf(num_format_str='DD MMM YY'))
+			elif varCol == lastAppt:
+				sheet.write(writeRow, varCol, entry[varCols.index(varCol)], 
+				easyxf(num_format_str='DD MMM YY'))
+				sheet.write(writeRow, varCol + archiveOffset, entry[varCols.index(varCol)], 
+				easyxf(num_format_str='DD MMM YY'))
+			elif varCol == fuNeedDate:
+				sheet.write(writeRow, varCol, entry[varCols.index(varCol)], 
+				easyxf(num_format_str='DD MMM YY'))
+				sheet.write(writeRow, varCol + archiveOffset, entry[varCols.index(varCol)], 
+				easyxf(num_format_str='DD MMM YY'))
+			elif varCol == conflictFlag: 
+				if entry[varCols.index(MRN)] in conflictMRNs:
+					sheet.write(writeRow, varCol, 1)
+				else:
+					sheet.write(writeRow, varCol, 0)
+			else:
+				sheet.write(writeRow, varCol, entry[varCols.index(varCol)])
+				sheet.write(writeRow, varCol + archiveOffset, entry[varCols.index(varCol)])
+		writeRow +=1
+	
+	'''
+	This picks up at the end of the data write & fills the age formula the rest of the way
+	to TabStop. 
+	'''
+	dataEnd = writeRow
+	for x in range(dataEnd,TabStop + firstDataRow):
+		ageForm = ('IF((TODAY()-D' + str(writeRow + 1) + ')/365<1,TEXT((TODAY()-D' + 
+					str(writeRow + 1) + ')/30,"#.0")&" mo",TEXT((TODAY()-D' + 
+					str(writeRow + 1) + ')/365,"#.0")&" yr")')
+		sheet.write(writeRow, ageCol, Formula(ageForm))
+		writeRow += 1
+	
+	'''
+	Formatting:
+	'''
+	sheet.panes_frozen = True
+	sheet.remove_splits = True
+	sheet.horz_split_pos = 2
+	for column in range(archiveOffset, archiveOffset + len(varCols)):
+		sheet.col(column).hidden = True
+	for column in range(0, archiveOffset + len(varCols)):
+		if (column == MRN or column == ageCol or column == PCP or column == MRN + 
+			archiveOffset or column == ageCol + archiveOffset or column == PCP + 
+			archiveOffset):
+				sheet.col(column).width = 256 * 8
+		elif column == probList or column == probList + archiveOffset:
+			sheet.col(column).width = 256 * 60
+	
+	#Output some results to StdIO
+	print "Wrote " + str(len(list)) + " records to " + str(varName)
+
+
+
+
+def preppedWriter(sheet):
+	'''
+	Write the Prepped formulas
+	These are destroyed by xlwt when it opens (really copies) the template file and so 
+	need to be coded back.
+	The named ranges & internal spreadsheet references get destroyed in this process, too,
+	but using the variables in this program to hardcode them back works, 
+	and so, that should not matter unless someone is tinkering with the spreadsheet 
+	downstream.
+	Helpful style examples:
+	http://reliablybroken.com/b/2011/07/styling-your-excel-data-with-xlwt/
+	'''
+	#Parameters for the Prepped sheet
+	startCol = 2
+	slots = 5
+	stopCol = startCol + slots
+	MRNrow = 1
+	refNote = 'CAS Jason M: 415.235.7402'
+	
+	#Write & format column A with basic boilerplate
+	sheet.write(MRNrow+5, 0, refNote, easyxf('alignment: wrap True;'))
+	for colA in range(0, startCol):
+		sheet.col(colA).width = 256 * 8
+	
+	#Python versions of the Excel named ranges
+	panelAll = ('Panel!' + Utils.rowcol_pair_to_cellrange(
+          row1=firstDataRow,col1=0,row2=MaxTabStop,col2=len(varCols)*3,
+          row1_abs=True,col1_abs=True,
+          row2_abs=True,col2_abs=True))
+	
+	MRNrange = ('Panel!' + Utils.rowcol_pair_to_cellrange(
+          row1=firstDataRow,col1=MRN,row2=MaxTabStop,col2=MRN,
+          row1_abs=True,col1_abs=True,
+          row2_abs=True,col2_abs=True))
+	
+	
+	'''
+	Loop over the range of columns set above to write formulas into the Prepped 
+	sheet. 
+	'''
+	for colP in range(startCol,stopCol+1):
+		MRNinput = Utils.rowcol_to_cell(MRNrow,colP,row_abs=True,col_abs=True)
+		
+		'''
+		Define apptTimes in this list as float - this is how Excel stores time as a 
+		fraction of 24 hr. E.g., noon = 0.5
+		This is the only way I've figured out to get the apptTimes formatted as time
+		'''
+		apptTimes = [0.55208333, 0.57291667, 0.59375, 0.61458333, 0.635416667, 0.6458333]
+		sheet.write(MRNrow-1, colP, apptTimes[colP-startCol], easyxf(num_format_str='h:mm'))
+	
+		'''
+		First, need to re-evaluate these strings through each loop cuz MRNinput needs
+		to be defined before each column is written.
+		'''	
+		nameForm = ('index(' + panelAll + ',match(' + MRNinput + ',' + MRNrange + ',0),' + 
+			str(lname+1)
+			+ ')&", "&index(' + panelAll + ',match(' + MRNinput + ',' + MRNrange + ',0),' + 
+			str(fname+1) 
+			+ ')')
+		parentForm = ('index(' + panelAll + ',match(' + MRNinput + ',' + MRNrange + ',0),' +
+			str(parent+1) + ')')
+		ageFormP = ('index(' + panelAll + ',match(' + MRNinput + ',' + MRNrange + ',0),' +
+			str(ageCol+1) + ')')
+		DOBForm = ('index(' + panelAll + ',match(' + MRNinput + ',' + MRNrange + ',0),' +
+			str(DOB+1) + ')')
+		probForm = 	('index(' + panelAll + ',match(' + MRNinput + ',' + MRNrange + ',0),' +
+			str(probList+1) + ')')
+		IZsForm = ('index(' + panelAll + ',match(' + MRNinput + ',' + MRNrange + ',0),' +
+			str(IZs+1) + ')')
+		devForm = ('index(' + panelAll + ',match(' + MRNinput + ',' + MRNrange + ',0),' +
+			str(dev+1) + ')')			
+
+		'''
+		print 'name', nameForm
+		print "parent", parentForm
+		print 'age', ageFormP
+		print 'DOB', DOBForm
+		print "prob", probForm
+		print 'IZ', IZsForm
+		print 'dev', devForm
+		'''
+		
+		'''
+		Loop through the list of formulas to write them into the Prepped sheet
+		'''
+		preppedRows = [(nameForm, MRNrow+1),
+			(parentForm, MRNrow+2),
+			(ageFormP, MRNrow+3),
+			(DOBForm, MRNrow+4),
+			(probForm, MRNrow+5),
+			(IZsForm, MRNrow+6),
+			(devForm, MRNrow+7)]
+		for preppedRow in preppedRows:
+			if preppedRow[0] == DOBForm:
+				sheet.write(preppedRow[1], colP, Formula(preppedRow[0]), 
+					easyxf(num_format_str='DD MMM YY'))
+			elif preppedRow[0] == probForm:
+				sheet.write(preppedRow[1], colP, Formula(preppedRow[0]))
+				#Set the height for probList row. For some reason, need to set the 
+				#height_mismatch parameter first.
+				sheet.row(preppedRow[1]).height_mismatch = True
+				sheet.row(preppedRow[1]).height = 5000
+
+			else:
+					sheet.write(preppedRow[1], colP, Formula(preppedRow[0]))
+		sheet.col(colP).width = 256 * 25
+
+	'''
+	Format the Whole Sheet
+	'''
+	sheet.panes_frozen = True
+	sheet.remove_splits = True
+	sheet.horz_split_pos = 1
+	
+	print 'Wrote the Prepped sheet'
+	
+	
+##################################
+#End of the modules
+#Everything below this is effectively the main - the reconciliation & output machine
+##################################
+
+#Read all files in "path" and run them through panelReader to get all entries to bigList
+dir = os.listdir(path)
+for filename in dir:
+	#Needs the proper path name
+	pathName = os.path.join(path, filename)
+	if pathName[-3:]== 'xls' or pathName[-4:] == 'xlsx':
+	#Need this if statement to keep .DS_Store etc from crashing the program
+	#v4 had a typo bug here, forgot the : in -4:
+		inputFiles.append(filename)
+		oldPanel = panelOpen(pathName)
+		#lastDataRow = rowEndFinder(oldPanel) - removed in v6
+		TabStops.append(panelReader(oldPanel))
+
+#Take the max of the TabStops just in case people have tinkered. Doesn't matter much if
+#the age formula runs over I don't think.
+MaxTabStop = max(TabStops)
+
+"""
+Loop through bigList to make a list of updateFlag+ MRNs
+If MRN appears twice, note for conflictMRNs
+	- Read through bigList, do updateFlag = 0 (updates) first!
+	- append to writeList (and to conflictList if in conflictMRNs)
+	- Then read bigList for updateFlag = 1
+	- if MRN not in writeList (ie first incidence), append to writeList
+	- if MRN already in writeList, just drop it
+"""
+
+#Make a list of which MRNs across all input panels have been updated
+for littleList in bigList:
+	updateFlagI =  littleList[-1]
+	if updateFlagI == 0:
+		updatedMRNs.append(littleList[varCols.index(MRN)])
+
+#Make a list of MRNs that appear 2+ times in the update list
+#i.e. they are conflicts with updates in multiple spreadsheets 
+#(or there are duplicates in the same sheet)
+for MRNi in updatedMRNs:
+	if updatedMRNs.count(MRNi) > 1:
+		conflictMRNs.append(MRNi)
+
+
+# Copy all the updated entries to writeList. Flag the conflicts
+# Copy updateFlag = 0 to writeList. conflictFlag = 1 if in conflictMRNs
+for littleList in bigList:
+	if littleList[-1] == 0: #i.e., if this is an updated entry
+		writeList.append(littleList)
+		writtenMRNs.append(littleList[varCols.index(MRN)])
+		if littleList[varCols.index(MRN)] in conflictMRNs:
+			littleList[-2] = 1 #Turn the conflictFlag to 1
+			conflictList.append(littleList)
+
+# Copy the non-updated entries, leaving out duplicates
+# If updateFlag = 1 (not updated), see if MRN is already in writeList
+	#If it is, just drop the littleList - this is a duplicate / old entry
+	#If it's not, it's the first old entry, so copy to write list 
+#Needs a sequentially separate loop to deal with avoiding duplicates
+for littleList in bigList:
+	if littleList[-1] == 1: #ie for non-updated entries in bigList
+		if littleList[varCols.index(MRN)] not in writtenMRNs:
+			writeList.append(littleList)
+			writtenMRNs.append(littleList[varCols.index(MRN)])
+
+#print to standard output, just so you can watch for data fragment issues.
+print 'fragList:', fragList
+
+##############
+#Run the loops and generate the actual panel spreadsheets!
+##############
+#Write the new, consolidated working panel:
+writeLoop(newBook, newPanel, sorted(writeList, key=lambda x: x[0]), newBookName, 
+	MaxTabStop)
+	
+'''
+sorted() alphabetizes the list using lambda to specify which item to sort on.
+Because I'm using lname which is [0], leaving out lambda also works:
+writeLoop(newBook, newPanel, sorted(writeList), newBookName, MaxTabStop)
+http://stackoverflow.com/questions/4174941/how-to-sort-a-list-of-lists-by-a-specific-index-of-the-inner-list
+
+MaxTabStop parameter added in v6 to write the age formula all the way down the sheet.
+'''
+
+#Write the Prepped formulas to the signout "Prepped" sheet
+preppedWriter(prepped)
+
+#Write data to the Version sheet
+versionSheet.write(1, 2, date.today(), easyxf( "align: horizontal left;", num_format_str='DD MMM YY'))
+versionSheet.write(2, 2, inputFiles)
+versionSheet.write(3, 2, os.path.basename(__file__))
+versionSheet.col(0).width = 265 * 5
+versionSheet.col(1).width = 265 * 25
+versionSheet.col(2).width = 265 * 70
+print 'Updated the %s Version data' % newBookName
+
+#Save the final product!	
+newBook.save(newBookName)
+
+#Then repeat the write loop for the conflicts:
+writeLoop(conBook, conPanel, sorted(conflictList, key=lambda x: x[0]), conBookName, 
+	MaxTabStop)
+
+#Save the final product!	
+conBook.save(conBookName)
+
+#Write data to the Version sheet
+versionSheetC.write(1, 2, date.today(), easyxf( "align: horizontal left;", num_format_str='DD MMM YY'))
+versionSheetC.write(2, 2, inputFiles)
+versionSheetC.write(3, 2, os.path.basename(__file__))
+versionSheetC.col(0).width = 265 * 5
+versionSheetC.col(1).width = 265 * 25
+versionSheetC.col(2).width = 265 * 70
+print 'Updated the %s Version data' % conBookName
